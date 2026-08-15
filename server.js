@@ -312,6 +312,44 @@ function pickFromChain(ips, rule) {
     return ips.find((ip) => !isNonPublic(ip)) ?? ips[0]; // leftmost public
 }
 
+/** Chain headers hold a comma-separated list, so a snippet has to index into it. */
+const isChain = (header) =>
+    CHAIN_HEADERS.includes(header) || header === "forwarded";
+
+/**
+ * What to read at the origin, and which entry of it.
+ *
+ * pick tells a reader which element of a chain header holds the client, and is
+ * null whenever the header carries a single address.
+ */
+function adviceFor(edge, forwarded, peerScope, chain, singles) {
+    if (edge) {
+        const header =
+            edge.headers?.[0] ?? chain?.header ?? "x-forwarded-for";
+        return {
+            trustProxy: edge.trustProxy,
+            header,
+            pick: isChain(header) ? (edge.pick ?? "leftmost") : null,
+            note: `Read only this header at the origin and drop the others, so nothing but ${edge.name} can set it.`,
+        };
+    }
+    if (forwarded && peerScope === "private") {
+        const header = chain?.header ?? singles[0]?.header ?? "x-real-ip";
+        return {
+            trustProxy: 1,
+            header,
+            pick: isChain(header) ? "leftmost" : null,
+            note: "Set your reverse proxy to overwrite this header rather than append to it, then trust exactly one hop.",
+        };
+    }
+    return {
+        trustProxy: false,
+        header: null,
+        pick: null,
+        note: "Nothing is proxying this server. Leave trust proxy off and read the socket.",
+    };
+}
+
 // Resolution
 function resolve(req) {
     const headers = req.headers;
@@ -434,23 +472,7 @@ function resolve(req) {
         if (hop.resolved) marked = true;
     }
 
-    const advice = edge
-        ? {
-              trustProxy: edge.trustProxy,
-              header: edge.headers?.[0] ?? chain?.header ?? "x-forwarded-for",
-              note: `Read only this header at the origin and drop the others, so nothing but ${edge.name} can set it.`,
-          }
-        : forwarded && peerScope === "private"
-          ? {
-                trustProxy: 1,
-                header: chain?.header ?? singles[0]?.header ?? "x-real-ip",
-                note: "Set your reverse proxy to overwrite this header rather than append to it, then trust exactly one hop.",
-            }
-          : {
-                trustProxy: false,
-                header: null,
-                note: "Nothing is proxying this server. Leave trust proxy off and read the socket.",
-            };
+    const advice = adviceFor(edge, forwarded, peerScope, chain, singles);
 
     return {
         ip,
@@ -585,6 +607,15 @@ const PAGE = `<!doctype html>
             }
             button:hover{border-color:var(--ink)}
             .row{display:flex;gap:8px;margin-top:28px;flex-wrap:wrap}
+            .tabs{display:flex;flex-wrap:wrap;gap:0;margin:18px 0 0;border-bottom:1px solid var(--line)}
+            .tab{
+                font-family:var(--mono);font-size:11px;letter-spacing:.06em;
+                background:none;border:none;border-bottom:2px solid transparent;
+                border-radius:0;padding:7px 11px;color:var(--muted);
+            }
+            .tab:hover{color:var(--ink)}
+            .tab[aria-selected=true]{color:var(--signal);border-bottom-color:var(--signal);font-weight:700}
+            .tabs + pre{margin-top:0;border-top:none;border-radius:0 0 3px 3px}
             .loading{color:var(--muted);font-family:var(--mono);font-size:14px}
             @media (prefers-reduced-motion:no-preference){
                 .hop{animation:in .3s ease both}
@@ -604,6 +635,221 @@ const PAGE = `<!doctype html>
                 if(!ip) return "unknown";
                 var sep = ip.indexOf(":") > -1 ? ":" : ".";
                 return ip.split(sep).map(esc).join('<span class="dot">' + sep + "</span>");
+            }
+
+            /**
+             * Same advice, written out for whatever is terminating the connection.
+             * Each builder gets the header to trust (null when nothing is proxying),
+             * how many hops sit in front, and which entry to take when the header
+             * carries a list rather than one address.
+             */
+            var PICK_WORDS = {
+                leftmost: "the leftmost entry",
+                rightmost: "the rightmost entry",
+                second_from_right: "the entry second from the right"
+            };
+
+            /** Comment that goes above a chain snippet, so the indexing is not a mystery. */
+            function chainNote(hdr, pick, marker){
+                return [marker + " " + hdr + " holds a list, take " + (PICK_WORDS[pick] || "the leftmost entry")];
+            }
+
+            /**
+             * RFC 7239 elements look like for="[2001:db8::1]:8080", which needs a real
+             * parser rather than a one-liner. Point people at the header their stack
+             * can actually read instead of handing them a broken split.
+             */
+            var FORWARDED_NOTE = [
+                "forwarded is RFC 7239, and almost nothing parses it out of the box",
+                "have the proxy set x-forwarded-for as well, then read that"
+            ];
+
+            var SNIPPETS = [
+                { id: "python", label: "Python", marker: "#", build: function(hdr, hops, pick){
+                    if(!hdr) return [
+                        "# http.server",
+                        "ip = self.client_address[0]",
+                        "",
+                        "# flask",
+                        "ip = request.remote_addr"
+                    ];
+                    if(pick){
+                        var at = { leftmost: "[0]", rightmost: "[-1]", second_from_right: "[-2]" }[pick];
+                        var enough = pick === "second_from_right" ? "len(chain) >= 2" : "chain";
+                        return chainNote(hdr, pick, "#").concat([
+                            'raw = self.headers.get("' + hdr + '", "")',
+                            'chain = [p.strip() for p in raw.split(",") if p.strip()]',
+                            "ip = chain" + at + " if " + enough + " else self.client_address[0]"
+                        ]);
+                    }
+                    return [
+                        "# http.server",
+                        'ip = self.headers.get("' + hdr + '", self.client_address[0])',
+                        "",
+                        "# flask",
+                        'ip = request.headers.get("' + hdr + '", request.remote_addr)',
+                        "",
+                        "# fastapi / starlette",
+                        'ip = request.headers.get("' + hdr + '") or request.client.host'
+                    ];
+                }},
+                { id: "node", label: "Node", marker: "//", build: function(hdr, hops, pick){
+                    if(!hdr) return [
+                        'app.set("trust proxy", false)',
+                        "const ip = req.socket.remoteAddress"
+                    ];
+                    var head = ['app.set("trust proxy", ' + hops + ")", ""];
+                    if(pick){
+                        var at = { leftmost: "[0]", rightmost: ".at(-1)", second_from_right: ".at(-2)" }[pick];
+                        return head.concat(chainNote(hdr, pick, "//")).concat([
+                            'const raw = String(req.headers["' + hdr + '"] ?? "")',
+                            'const chain = raw.split(",").map(s => s.trim()).filter(Boolean)',
+                            "const ip = chain" + at + " ?? req.socket.remoteAddress"
+                        ]);
+                    }
+                    return head.concat([
+                        "// read the one header the edge controls, ignore the rest",
+                        'const ip = req.headers["' + hdr + '"] ?? req.socket.remoteAddress'
+                    ]);
+                }},
+                { id: "go", label: "Go", marker: "//", build: function(hdr, hops, pick){
+                    if(!hdr) return [
+                        "ip, _, _ := net.SplitHostPort(r.RemoteAddr)"
+                    ];
+                    if(pick){
+                        var at = {
+                            leftmost: "parts[0]",
+                            rightmost: "parts[len(parts)-1]",
+                            second_from_right: "parts[len(parts)-2]"
+                        }[pick];
+                        var lines = chainNote(hdr, pick, "//").concat([
+                            'parts := strings.Split(r.Header.Get("' + hdr + '"), ",")'
+                        ]);
+                        if(pick === "second_from_right"){
+                            return lines.concat([
+                                "ip, _, _ := net.SplitHostPort(r.RemoteAddr)",
+                                "if len(parts) >= 2 {",
+                                "    ip = strings.TrimSpace(" + at + ")",
+                                "}"
+                            ]);
+                        }
+                        return lines.concat(["ip := strings.TrimSpace(" + at + ")"]);
+                    }
+                    return [
+                        'ip := r.Header.Get("' + hdr + '")',
+                        'if ip == "" {',
+                        "    ip, _, _ = net.SplitHostPort(r.RemoteAddr)",
+                        "}"
+                    ];
+                }},
+                { id: "rust", label: "Rust", marker: "//", build: function(hdr, hops, pick){
+                    if(!hdr) return [
+                        "// axum: ConnectInfo<SocketAddr> extractor",
+                        "let ip = addr.ip().to_string();"
+                    ];
+                    if(pick){
+                        var at = {
+                            leftmost: ".next()",
+                            rightmost: ".rev().nth(0)",
+                            second_from_right: ".rev().nth(1)"
+                        }[pick];
+                        return chainNote(hdr, pick, "//").concat([
+                            'let raw = headers.get("' + hdr + '")',
+                            "    .and_then(|v| v.to_str().ok())",
+                            '    .unwrap_or("");',
+                            "let ip = raw.split(',').map(str::trim)" + at,
+                            "    .map(str::to_owned)",
+                            "    .unwrap_or_else(|| addr.ip().to_string());"
+                        ]);
+                    }
+                    return [
+                        "// axum: HeaderMap + ConnectInfo<SocketAddr> extractors",
+                        "let ip = headers",
+                        '    .get("' + hdr + '")',
+                        "    .and_then(|v| v.to_str().ok())",
+                        "    .map(str::to_owned)",
+                        "    .unwrap_or_else(|| addr.ip().to_string());"
+                    ];
+                }},
+                { id: "php", label: "PHP", marker: "//", build: function(hdr, hops, pick){
+                    if(!hdr) return [
+                        "$ip = $_SERVER['REMOTE_ADDR'];"
+                    ];
+                    var key = "HTTP_" + hdr.toUpperCase().replace(/-/g, "_");
+                    if(pick){
+                        var at = {
+                            leftmost: "$chain[0] ??",
+                            rightmost: "end($chain) ?:",
+                            second_from_right: "$chain[count($chain) - 2] ??"
+                        }[pick];
+                        return chainNote(hdr, pick, "//").concat([
+                            "$raw = $_SERVER['" + key + "'] ?? '';",
+                            "$chain = array_values(array_filter(array_map('trim', explode(',', $raw))));",
+                            "$ip = " + at + " $_SERVER['REMOTE_ADDR'];"
+                        ]);
+                    }
+                    return [
+                        "$ip = $_SERVER['" + key + "'] ?? $_SERVER['REMOTE_ADDR'];"
+                    ];
+                }},
+                { id: "nginx", label: "nginx", marker: "#", build: function(hdr, hops, pick){
+                    if(!hdr) return [
+                        "# nothing in front, $remote_addr is already the client",
+                        "# leave real_ip_header unset"
+                    ];
+                    var lines = [
+                        "# replace with the edge's published ranges, never 0.0.0.0/0",
+                        "set_real_ip_from 0.0.0.0/0;",
+                        "real_ip_header " + hdr + ";"
+                    ];
+                    if(pick === "rightmost" || !pick) lines.push("real_ip_recursive off;");
+                    else lines.push(
+                        "# recursive walks right to left past every trusted range above",
+                        "real_ip_recursive on;"
+                    );
+                    return lines;
+                }},
+                { id: "caddy", label: "Caddy", marker: "#", build: function(hdr, hops, pick){
+                    if(!hdr) return [
+                        "# nothing in front, no trusted_proxies needed"
+                    ];
+                    var lines = [
+                        "servers {",
+                        "    # replace with the edge's published ranges",
+                        "    trusted_proxies static 0.0.0.0/0",
+                        "    client_ip_headers " + hdr
+                    ];
+                    if(pick) lines.push("    # caddy walks the list right to left, skipping trusted ranges");
+                    lines.push("}");
+                    return lines;
+                }}
+            ];
+
+            var activeSnippet = SNIPPETS[0].id;
+
+            function snippetBlock(advice){
+                var chosen = SNIPPETS.filter(function(s){ return s.id === activeSnippet; })[0] || SNIPPETS[0];
+                var h = '<div class="tabs" role="tablist">';
+                SNIPPETS.forEach(function(s){
+                    h += '<button class="tab" role="tab" data-snippet="' + s.id +
+                        '" aria-selected="' + (s.id === chosen.id ? "true" : "false") + '">' +
+                        esc(s.label) + "</button>";
+                });
+                var hdr = advice.header;
+                var lead = [];
+                if(hdr === "forwarded"){
+                    lead = FORWARDED_NOTE.map(function(line){ return chosen.marker + " " + line; });
+                    hdr = "x-forwarded-for";
+                }
+                // trustProxy can be false or a preset name; a snippet needs a number
+                var hops = typeof advice.trustProxy === "number" ? advice.trustProxy : 1;
+                // this file spells the rule secondFromRight, the builders key on snake_case
+                var pick = advice.pick
+                    ? advice.pick.replace(/([A-Z])/g, function(c){ return "_" + c.toLowerCase(); })
+                    : null;
+                var body = lead.concat(chosen.build(hdr, hops, pick));
+                h += "</div><pre>" + esc(body.join("\\n")) + "</pre>";
+                return h;
             }
 
             function render(d){
@@ -635,9 +881,8 @@ const PAGE = `<!doctype html>
 
                 h += '<section><p class="eyebrow">Lock it down</p>';
                 h += '<p class="verdict">' + esc(d.advice.note) + "</p>";
-                h += "<pre>app.set('trust proxy', " + esc(JSON.stringify(d.advice.trustProxy)) + ")";
-                if(d.advice.header) h += "\\nconst ip = req.headers['" + esc(d.advice.header) + "']";
-                h += "</pre></section>";
+                h += snippetBlock(d.advice);
+                h += "</section>";
 
                 if(d.candidates && d.candidates.length){
                     h += "<section><details><summary>All " + d.candidates.length + " sources seen</summary>";
@@ -660,6 +905,13 @@ const PAGE = `<!doctype html>
                     });
                 });
                 document.getElementById("again").addEventListener("click", load);
+
+                Array.prototype.forEach.call(document.querySelectorAll(".tab"), function(tab){
+                    tab.addEventListener("click", function(){
+                        activeSnippet = tab.getAttribute("data-snippet");
+                        render(d);  // cheap enough, and it keeps one code path
+                    });
+                });
             }
 
             function load(){
