@@ -65,6 +65,22 @@ With no recognized edge it falls back, and says so in `confidence` and `reason`:
 
 `spoofable` says which of the two you got.
 
+## Lock it down
+
+The HTML page ends with the config you actually need, for whatever is terminating the
+connection: Python (`http.server`, Flask, FastAPI), Node/Express, Go, Rust/axum, PHP,
+nginx and Caddy. Pick a tab and copy.
+
+The snippets are generated from the resolution, not canned, so they name the one header
+worth trusting and — when that header carries a list rather than a single address — index
+into the right entry. `advice.pick` in the JSON carries that rule (`leftmost`,
+`rightmost`, `second_from_right`, or `null` for a single-value header).
+
+Two things the snippets won't do for you: the `0.0.0.0/0` in the nginx and Caddy examples
+is a placeholder for the edge's published ranges, and if the only chain header is RFC 7239
+`Forwarded`, they tell you to have the proxy set `x-forwarded-for` too rather than pretend
+a one-line split can parse `for="[2001:db8::1]:8080"`.
+
 ## Port of the Express version
 
 The Express server lives on the `node-express` branch. Same routes, same detection
@@ -76,6 +92,8 @@ the JSON, because they named Node APIs:
 | `source: "socket.remoteAddress"` | `source: "socket peer"`    |
 | `advice.trustProxy`             | `advice.trusted_hops`      |
 | candidate `req.ip`              | candidate `trusted-hop walk` |
+
+`advice.pick` is new here, and the page's snippet section is new with it.
 
 `trusted-hop walk` is the same right-to-left walk Express's `req.ip` does over the
 chain, stopping at the first address the server didn't put there. It normalizes
